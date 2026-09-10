@@ -26,6 +26,7 @@ from agent_helpers import (
     tool_call_response,
 )
 from pi_ai import Cost, Model, TextContent, ToolCall, Usage, UserMessage, now_ms
+from pi_ai.utils.abort import AbortController
 
 from pi_agent import (
     AfterToolCallResult,
@@ -667,6 +668,155 @@ async def test_prepare_next_turn_snapshot_is_used_before_continuing():
 
     assert len(stream_fn.calls) == 2
     assert stream_fn.calls[1]["context"].system_prompt == "second prompt"
+
+
+async def test_prepare_next_turn_runs_once_per_continuing_turn():
+    """`prepareNextTurn` fires at the start of each continued turn, not after every turn.
+
+    Regression test for the port deviation where `prepare_next_turn` ran right
+    after `turn_end`, before the `should_stop_after_turn` check -- so it also
+    fired for turns the loop never continues from. agent-loop.ts keeps the last
+    completed turn and only prepares at the top of the next inner-loop iteration.
+    """
+    prepare_calls: list[list[str]] = []
+
+    async def prepare_next_turn(turn):
+        prepare_calls.append([m.role for m in turn.new_messages])
+        return None
+
+    stream_fn = scripted_stream_fn(
+        [
+            tool_call_response(ToolCall(id="c1", name="echo", arguments={"value": "a"})),
+            tool_call_response(ToolCall(id="c2", name="echo", arguments={"value": "b"})),
+            text_response("done"),
+        ]
+    )
+
+    _events, messages = await collect_events(
+        agent_loop(
+            [UserMessage(content="hi")],
+            AgentContext(tools=[echo_tool()]),
+            make_config(prepare_next_turn=prepare_next_turn),
+            None,
+            stream_fn,
+        )
+    )
+
+    # Three turns streamed; the last one ends the run, so preparation only
+    # happens before turns two and three.
+    assert len(stream_fn.calls) == 3
+    assert prepare_calls == [
+        ["user", "assistant", "toolResult"],
+        ["user", "assistant", "toolResult", "assistant", "toolResult"],
+    ]
+    assert messages[-1].content[0].text == "done"
+
+
+async def test_prepare_next_turn_not_called_when_should_stop_after_turn_ends_the_run():
+    prepare_calls = {"count": 0}
+
+    async def prepare_next_turn(turn):
+        prepare_calls["count"] += 1
+        return None
+
+    async def should_stop_after_turn(turn):
+        return True
+
+    stream_fn = scripted_stream_fn(
+        [
+            tool_call_response(ToolCall(id="c1", name="echo", arguments={"value": "x"})),
+            text_response("should not run"),
+        ]
+    )
+
+    _events, messages = await collect_events(
+        agent_loop(
+            [UserMessage(content="hi")],
+            AgentContext(tools=[echo_tool()]),
+            make_config(prepare_next_turn=prepare_next_turn, should_stop_after_turn=should_stop_after_turn),
+            None,
+            stream_fn,
+        )
+    )
+
+    assert len(stream_fn.calls) == 1
+    assert prepare_calls["count"] == 0
+    assert [m.role for m in messages] == ["user", "assistant", "toolResult"]
+
+
+async def test_prepare_next_turn_not_called_after_a_natural_final_turn():
+    """A turn that ends the run without tool calls is never prepared from."""
+    prepare_calls = {"count": 0}
+
+    async def prepare_next_turn(turn):
+        prepare_calls["count"] += 1
+        return None
+
+    stream_fn = scripted_stream_fn([text_response("done")])
+
+    await collect_events(
+        agent_loop(
+            [UserMessage(content="hi")],
+            AgentContext(),
+            make_config(prepare_next_turn=prepare_next_turn),
+            None,
+            stream_fn,
+        )
+    )
+
+    assert len(stream_fn.calls) == 1
+    assert prepare_calls["count"] == 0
+
+
+async def test_parallel_tool_execution_aborts_before_execute_when_signal_trips_after_preflight():
+    """Abort landing between the batch's `before_tool_call` gates and tool start.
+
+    Parallel runners only launch after every preparation in the batch resolves,
+    so an abort during a later preparation must stop the earlier, already-prepared
+    tools from executing. agent-loop.ts checks `signal?.aborted` at the top of
+    each parallel closure and returns an "Operation aborted" result instead of
+    running the tool; the port missed that check.
+    """
+    controller = AbortController()
+    executed: list[str] = []
+    before_calls: list[str] = []
+
+    async def execute(tool_call_id, params, signal=None, on_update=None):
+        executed.append(tool_call_id)
+        return AgentToolResult(content=[TextContent(text="should not run")], details={})
+
+    async def before_tool_call(context, signal=None):
+        before_calls.append(context.tool_call.id)
+        if context.tool_call.id == "c2":
+            controller.abort()
+        return None
+
+    message = make_assistant_message(
+        [
+            ToolCall(id="c1", name="echo", arguments={"value": "a"}),
+            ToolCall(id="c2", name="echo", arguments={"value": "b"}),
+        ],
+        stop_reason="toolUse",
+    )
+    stream_fn = scripted_stream_fn([message, text_response("done")])
+
+    events, messages = await collect_events(
+        agent_loop(
+            [UserMessage(content="hi")],
+            AgentContext(tools=[echo_tool(execute=execute)]),
+            make_config(before_tool_call=before_tool_call),
+            controller.signal,
+            stream_fn,
+        )
+    )
+
+    assert before_calls == ["c1", "c2"]
+    assert executed == []
+    tool_ends = [event for event in events if event.type == "tool_execution_end"]
+    assert len(tool_ends) == 2
+    assert all(event.is_error for event in tool_ends)
+    tool_results = [m for m in messages if m.role == "toolResult"]
+    assert [m.content[0].text for m in tool_results] == ["Operation aborted", "Operation aborted"]
 
 
 async def test_transform_context_runs_before_conversion():

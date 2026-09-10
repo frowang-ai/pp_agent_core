@@ -192,7 +192,7 @@ async def _run_loop(
 ) -> None:
     current_context = initial_context
     config = initial_config
-    first_turn = True
+    last_completed_turn: PrepareNextTurnContext | None = None
     # The user may have typed while the previous run was still finishing.
     pending_messages: list[AgentMessage] = await _call_optional_list(config.get_steering_messages)
 
@@ -200,10 +200,25 @@ async def _run_loop(
         has_more_tool_calls = True
 
         while has_more_tool_calls or pending_messages:
-            if not first_turn:
+            if last_completed_turn is not None:
+                if config.prepare_next_turn is not None:
+                    snapshot = await _maybe_await(config.prepare_next_turn(last_completed_turn))
+                    if snapshot:
+                        current_context = snapshot.context or current_context
+                        reasoning = config.reasoning
+                        if snapshot.thinking_level is not None:
+                            reasoning = None if snapshot.thinking_level == "off" else snapshot.thinking_level
+                        config = replace(
+                            config,
+                            model=snapshot.model or config.model,
+                            reasoning=reasoning,
+                        )
+                # Preparation can be long-running (for example, compaction). Pick up steering
+                # queued while it ran. Only poll again if the earlier poll returned nothing;
+                # otherwise one-at-a-time mode would deliver two messages in this turn.
+                if not pending_messages:
+                    pending_messages = await _call_optional_list(config.get_steering_messages)
                 await _maybe_await(emit(TurnStartEvent()))
-            else:
-                first_turn = False
 
             if pending_messages:
                 for message in pending_messages:
@@ -242,24 +257,12 @@ async def _run_loop(
 
             await _maybe_await(emit(TurnEndEvent(message=message, tool_results=tool_results)))
 
-            next_turn_context = PrepareNextTurnContext(
+            last_completed_turn = PrepareNextTurnContext(
                 message=message,
                 tool_results=tool_results,
                 context=current_context,
                 new_messages=new_messages,
             )
-            if config.prepare_next_turn is not None:
-                snapshot = await _maybe_await(config.prepare_next_turn(next_turn_context))
-                if snapshot:
-                    current_context = snapshot.context or current_context
-                    reasoning = config.reasoning
-                    if snapshot.thinking_level is not None:
-                        reasoning = None if snapshot.thinking_level == "off" else snapshot.thinking_level
-                    config = replace(
-                        config,
-                        model=snapshot.model or config.model,
-                        reasoning=reasoning,
-                    )
 
             if config.should_stop_after_turn is not None:
                 should_stop = await _maybe_await(
@@ -532,6 +535,14 @@ async def _execute_tool_calls_parallel(
         # what makes the abort check after each preparation meaningful.
         def make_runner(prepared: _PreparedToolCall = preparation):
             async def run_prepared() -> _FinalizedToolCallOutcome:
+                if signal is not None and signal.aborted:
+                    finalized_call = _FinalizedToolCallOutcome(
+                        tool_call=prepared.tool_call,
+                        result=_create_error_tool_result("Operation aborted"),
+                        is_error=True,
+                    )
+                    await _emit_tool_execution_end(finalized_call, emit)
+                    return finalized_call
                 executed = await _execute_prepared_tool_call(prepared, signal, emit)
                 finalized_call = await _finalize_executed_tool_call(
                     current_context, assistant_message, prepared, executed, config, signal

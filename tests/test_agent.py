@@ -891,16 +891,20 @@ async def test_prepare_next_turn_with_context_takes_precedence():
         context_calls.append([m.role for m in context.new_messages])
         return None
 
+    # Two turns: `prepare_next_turn` only runs at the start of a continuing
+    # turn (matching `runLoop` in agent-loop.ts), so a single-turn run would
+    # never invoke it.
     agent = make_agent(
-        [text_response("done")],
+        [tool_call_response(ToolCall(id="c1", name="echo", arguments={})), text_response("done")],
         prepare_next_turn=legacy,
         prepare_next_turn_with_context=with_context,
     )
+    agent.state.tools = [echo_tool()]
 
     await asyncio.wait_for(agent.prompt("start"), timeout=TIMEOUT)
 
     assert legacy_calls == []
-    assert context_calls == [["user", "assistant"]]
+    assert context_calls == [["user", "assistant", "toolResult"]]
 
 
 async def test_prepare_next_turn_can_swap_the_model():
